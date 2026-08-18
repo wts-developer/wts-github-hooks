@@ -1,0 +1,191 @@
+name: Close Asana tasks on merged PRs
+
+# Completes Asana tasks referenced in a merged PR's description.
+# Convention: put "closes <asana task URL>" or "closes <bare task id>"
+# (case-insensitive) in the PR body, one per task. Only MERGED PRs
+# complete tasks; a PR closed without merging leaves its tasks open.
+#
+# On completion the workflow also: selects the Complete option on a
+# Status enum custom field when the task has one, comments the PR link
+# on the task, and rewrites bare task ids in the PR body into clickable
+# Asana links.
+#
+# This is the SHARED copy: other wts repos consume it with a small
+# caller workflow (see the README) via workflow_call. It also runs
+# directly for PRs against this repo. Needs an ASANA_PAT secret (an
+# Asana personal access token, ideally from a service account), best
+# managed as a wts-developer org secret shared with consuming repos.
+#
+# Deterministic automation on GitHub-managed runners: no AI in the
+# loop, and the only data touched is the Asana task id from the PR
+# body and its completion state.
+on:
+  pull_request:
+    types: [closed]
+  workflow_call:
+    secrets:
+      ASANA_PAT:
+        required: true
+
+# pull-requests: write lets the job rewrite bare task ids in the PR
+# body into clickable Asana links after completing them.
+permissions:
+  pull-requests: write
+
+jobs:
+  close-asana:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Complete referenced Asana tasks
+        env:
+          ASANA_PAT: ${{ secrets.ASANA_PAT }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 - <<'PYEOF'
+          import json
+          import os
+          import re
+          import sys
+          import urllib.request
+
+          body = os.environ.get("PR_BODY") or ""
+          pat = os.environ.get("ASANA_PAT") or ""
+          pr_url = os.environ.get("PR_URL") or ""
+
+          # "closes <asana task URL>": accept any app.asana.com URL and
+          # read the task gid as the last long digit run in its path
+          # (covers both classic /0/<project>/<task> and newer
+          # /1/<workspace>/.../task/<task> URL shapes).
+          refs = re.findall(
+              r"closes\s+<?(https://app\.asana\.com/[^\s>),]+)",
+              body, re.IGNORECASE,
+          )
+          gids = []
+          for url in refs:
+              digits = re.findall(r"/(\d{6,})", url)
+              if digits:
+                  gids.append(digits[-1])
+          # "closes <bare task id>": a long digit run works too (Asana
+          # gids are 10+ digits, so this can't collide with GitHub's
+          # "closes #123" issue references).
+          gids += re.findall(r"closes\s+(\d{10,})\b", body, re.IGNORECASE)
+          gids = list(dict.fromkeys(gids))
+
+          if not gids:
+              print("No 'closes <asana task URL>' references in the PR body; nothing to do.")
+              sys.exit(0)
+          if not pat:
+              print("::error::ASANA_PAT secret is not set but the PR references Asana tasks.")
+              sys.exit(1)
+
+          def get(path):
+              req = urllib.request.Request(
+                  f"https://app.asana.com/api/1.0{path}",
+                  headers={"Authorization": f"Bearer {pat}"},
+              )
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return json.load(resp)
+
+          def call(path, payload, method):
+              req = urllib.request.Request(
+                  f"https://app.asana.com/api/1.0{path}",
+                  data=json.dumps({"data": payload}).encode(),
+                  headers={
+                      "Authorization": f"Bearer {pat}",
+                      "Content-Type": "application/json",
+                  },
+                  method=method,
+              )
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return json.load(resp)
+
+          # Retroactively turn bare task ids in the PR body into
+          # clickable Asana links (URL references already auto-link).
+          # Best effort: a failure here never blocks task completion.
+          def linkify_body():
+              gh_token = os.environ.get("GITHUB_TOKEN") or ""
+              repo = os.environ.get("REPO") or ""
+              pr_number = os.environ.get("PR_NUMBER") or ""
+              if not (gh_token and repo and pr_number):
+                  return
+              new_body = re.sub(
+                  r"(closes\s+)(\d{10,})\b",
+                  lambda m: (
+                      f"{m.group(1)}[{m.group(2)}]"
+                      f"(https://app.asana.com/0/0/{m.group(2)}/f)"
+                  ),
+                  body, flags=re.IGNORECASE,
+              )
+              if new_body == body:
+                  return
+              try:
+                  req = urllib.request.Request(
+                      f"https://api.github.com/repos/{repo}/pulls/{pr_number}",
+                      data=json.dumps({"body": new_body}).encode(),
+                      headers={
+                          "Authorization": f"Bearer {gh_token}",
+                          "Accept": "application/vnd.github+json",
+                          "Content-Type": "application/json",
+                      },
+                      method="PATCH",
+                  )
+                  with urllib.request.urlopen(req, timeout=30):
+                      pass
+                  print("Linked bare Asana task ids in the PR body")
+              except Exception as exc:
+                  print(f"::warning::Could not linkify the PR body: {exc}")
+
+          linkify_body()
+
+          def set_status_complete(gid):
+              """Best effort: project boards often track a Status enum
+              custom field separately from Asana's built-in completed
+              flag. If the task has a field named Status with a
+              Complete option, select it; otherwise skip quietly."""
+              try:
+                  fields = get(
+                      f"/tasks/{gid}?opt_fields=custom_fields.name,"
+                      "custom_fields.resource_subtype,"
+                      "custom_fields.enum_options.name,"
+                      "custom_fields.enum_options.enabled"
+                  )["data"].get("custom_fields") or []
+                  for field in fields:
+                      if (field.get("name") or "").strip().lower() != "status":
+                          continue
+                      if field.get("resource_subtype") != "enum":
+                          continue
+                      for option in field.get("enum_options") or []:
+                          name = (option.get("name") or "").strip().lower()
+                          if name == "complete" and option.get("enabled", True):
+                              call(
+                                  f"/tasks/{gid}",
+                                  {"custom_fields": {field["gid"]: option["gid"]}},
+                                  "PUT",
+                              )
+                              print(f"Set Status=Complete on Asana task {gid}")
+                              return
+                  print(f"Task {gid}: no Status field with a Complete option; left as is")
+              except Exception as exc:
+                  print(f"::warning::Could not set Status on Asana task {gid}: {exc}")
+
+          failures = 0
+          for gid in gids:
+              try:
+                  call(f"/tasks/{gid}", {"completed": True}, "PUT")
+                  set_status_complete(gid)
+                  call(
+                      f"/tasks/{gid}/stories",
+                      {"text": f"Completed automatically: merged {pr_url}"},
+                      "POST",
+                  )
+                  print(f"Completed Asana task {gid}")
+              except Exception as exc:
+                  print(f"::error::Could not complete Asana task {gid}: {exc}")
+                  failures += 1
+          sys.exit(1 if failures else 0)
+          PYEOF
