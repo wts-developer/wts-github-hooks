@@ -34,7 +34,13 @@ permissions:
 
 jobs:
   close-asana:
-    if: github.event.pull_request.merged == true
+    # Skip entirely (no runner spin-up) unless the PR merged AND the
+    # body plausibly contains a closes reference. contains() is
+    # case-insensitive and coarse by design; the script's parser makes
+    # the precise call, so prose like "closes the loop" just no-ops.
+    if: >-
+      github.event.pull_request.merged == true &&
+      contains(github.event.pull_request.body, 'closes')
     runs-on: ubuntu-latest
     steps:
       - name: Complete referenced Asana tasks
