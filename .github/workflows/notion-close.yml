@@ -1,0 +1,244 @@
+name: Close Notion tasks on merged PRs
+
+# Marks Notion tasks referenced in a merged PR's description complete.
+# Convention: put "closes <notion task URL>" or "closes <bare page id>"
+# (case-insensitive) in the PR body, one per task. A markdown link
+# ("closes [title](<notion URL>)") works too. Only MERGED PRs complete
+# tasks; a PR closed without merging leaves its tasks open.
+#
+# "Complete" means whatever the task's database has, each best effort:
+# a Status column (select or status) set to its Complete option (or
+# Done), a Completed checkbox ticked, and an empty Completed at date set
+# to today. Nothing is created: a database without one of these is
+# simply left alone there. The workflow then comments the PR link on
+# the task and rewrites bare page ids in the PR body into Notion links.
+#
+# This is the SHARED copy: other wts repos consume it with a small
+# caller workflow (see the README) via workflow_call. It also runs
+# directly for PRs against this repo. Needs a NOTION_TOKEN secret (an
+# internal Notion connection's token; the task databases must be shared
+# with that connection), best managed as a wts-developer org secret.
+#
+# Deterministic automation on GitHub-managed runners: no AI in the
+# loop, and the only data touched is the page id from the PR body and
+# the completion columns named above.
+on:
+  pull_request:
+    types: [closed]
+  workflow_call:
+    secrets:
+      NOTION_TOKEN:
+        required: true
+
+# pull-requests: write lets the job rewrite bare page ids in the PR
+# body into clickable Notion links after completing them.
+permissions:
+  pull-requests: write
+
+jobs:
+  close-notion:
+    # Skip entirely (no runner spin-up) unless the PR merged AND the
+    # body plausibly contains a closes reference. contains() is
+    # case-insensitive and coarse by design; the script's parser makes
+    # the precise call, so prose like "closes the loop" just no-ops.
+    if: >-
+      github.event.pull_request.merged == true &&
+      contains(github.event.pull_request.body, 'closes')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Complete referenced Notion tasks
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 - <<'PYEOF'
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timezone
+
+          body = os.environ.get("PR_BODY") or ""
+          token = os.environ.get("NOTION_TOKEN") or ""
+          pr_url = os.environ.get("PR_URL") or ""
+
+          # A page id as it appears in text: 32 hex chars or the dashed
+          # UUID form, not touching other hex on either side (so a
+          # title slug's trailing hex letters never join the id).
+          ID = (r"(?<![0-9a-fA-F])([0-9a-fA-F]{32}"
+                r"|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+                r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?![0-9a-fA-F])")
+
+          def norm(raw):
+              raw = raw.replace("-", "").lower()
+              return (f"{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-"
+                      f"{raw[16:20]}-{raw[20:32]}")
+
+          def page_id_from_url(url):
+              """The page a Notion URL points at. A database view with a
+              task open in peek mode carries the task as ?p=<id>; that
+              wins over the path, which names the database."""
+              parsed = urllib.parse.urlparse(url)
+              peek = urllib.parse.parse_qs(parsed.query).get("p") or []
+              for value in peek + [parsed.path]:
+                  found = re.findall(ID, value)
+                  if found:
+                      return norm(found[-1])
+              return None
+
+          # "closes <notion URL>", optionally wrapped as a markdown link
+          # ("closes [title](url)") or in angle brackets.
+          urls = re.findall(
+              r"closes\s+(?:\[[^\]]*\]\()?<?"
+              r"(https?://[\w.-]*notion\.(?:so|site|com)/[^\s>)]+)",
+              body, re.IGNORECASE,
+          )
+          ids = [page_id_from_url(u) for u in urls]
+          # "closes <bare page id>". Asana gids are all digits and
+          # shorter, and GitHub's "closes #123" has a hash, so neither
+          # collides with a 32-hex id.
+          ids += [norm(m) for m in re.findall(r"closes\s+" + ID, body, re.IGNORECASE)]
+          ids = list(dict.fromkeys(i for i in ids if i))
+
+          if not ids:
+              print("No 'closes <notion task URL>' references in the PR body; nothing to do.")
+              sys.exit(0)
+          print(f"Found {len(ids)} Notion task reference(s): {', '.join(ids)}")
+          if not token:
+              print("::error::NOTION_TOKEN secret is not set but the PR references Notion tasks.")
+              sys.exit(1)
+
+          def notion(method, path, payload=None):
+              req = urllib.request.Request(
+                  f"https://api.notion.com/v1{path}",
+                  data=json.dumps(payload).encode() if payload is not None else None,
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Notion-Version": "2022-06-28",
+                      "Content-Type": "application/json",
+                  },
+                  method=method,
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      return json.load(resp)
+              except urllib.error.HTTPError as exc:
+                  # Notion's error body is a code and a message, never
+                  # page content; it says why (unshared, bad option...).
+                  try:
+                      detail = json.load(exc).get("message", "")
+                  except Exception:
+                      detail = ""
+                  if exc.code == 404:
+                      detail = ("not found, or not shared with the connection "
+                                "behind NOTION_TOKEN")
+                  raise RuntimeError(f"{method} {path} -> {exc.code}: {detail}") from None
+
+          # Retroactively turn bare page ids in the PR body into
+          # clickable Notion links (URL references already auto-link).
+          # Best effort: a failure here never blocks task completion.
+          def linkify_body():
+              gh_token = os.environ.get("GITHUB_TOKEN") or ""
+              repo = os.environ.get("REPO") or ""
+              pr_number = os.environ.get("PR_NUMBER") or ""
+              if not (gh_token and repo and pr_number):
+                  return
+              new_body = re.sub(
+                  r"(closes\s+)" + ID,
+                  lambda m: (
+                      f"{m.group(1)}[{m.group(2)}]"
+                      f"(https://www.notion.so/{m.group(2).replace('-', '')})"
+                  ),
+                  body, flags=re.IGNORECASE,
+              )
+              if new_body == body:
+                  return
+              try:
+                  req = urllib.request.Request(
+                      f"https://api.github.com/repos/{repo}/pulls/{pr_number}",
+                      data=json.dumps({"body": new_body}).encode(),
+                      headers={
+                          "Authorization": f"Bearer {gh_token}",
+                          "Accept": "application/vnd.github+json",
+                          "Content-Type": "application/json",
+                      },
+                      method="PATCH",
+                  )
+                  with urllib.request.urlopen(req, timeout=30):
+                      pass
+                  print("Linked bare Notion page ids in the PR body")
+              except Exception as exc:
+                  print(f"::warning::Could not linkify the PR body: {exc}")
+
+          linkify_body()
+
+          STATUS_NAMES = ("status",)
+          DONE_OPTIONS = ("complete", "completed", "done")
+          CHECKBOX_NAMES = ("completed", "done")
+          DATE_NAMES = ("completed at", "completed on", "date completed")
+
+          def completion_patch(page, schema):
+              """Properties to send, from what the database actually has.
+              Options are matched by name and sent by id, so nothing is
+              ever created; a date already filled in is left alone."""
+              patch = {}
+              values = page.get("properties") or {}
+              for name, prop in schema.items():
+                  key, kind = name.strip().lower(), prop.get("type")
+                  if key in STATUS_NAMES and kind in ("select", "status"):
+                      options = (prop.get(kind) or {}).get("options") or []
+                      by_name = {(o.get("name") or "").strip().lower(): o["id"]
+                                 for o in options if o.get("id")}
+                      done = next((by_name[n] for n in DONE_OPTIONS if n in by_name), None)
+                      if done:
+                          patch[name] = {kind: {"id": done}}
+                  elif key in CHECKBOX_NAMES and kind == "checkbox":
+                      patch[name] = {"checkbox": True}
+                  elif key in DATE_NAMES and kind == "date":
+                      if not (values.get(name) or {}).get("date"):
+                          today = datetime.now(timezone.utc).date().isoformat()
+                          patch[name] = {"date": {"start": today}}
+              return patch
+
+          def comment(page_id):
+              try:
+                  notion("POST", "/comments", {
+                      "parent": {"page_id": page_id},
+                      "rich_text": [
+                          {"type": "text", "text": {"content": "Completed automatically: merged "}},
+                          {"type": "text", "text": {"content": pr_url, "link": {"url": pr_url}}},
+                      ],
+                  })
+              except Exception as exc:
+                  # Commenting needs the connection's "insert comments"
+                  # capability; the task is already complete without it.
+                  print(f"::warning::Could not comment on Notion task {page_id}: {exc}")
+
+          failures = 0
+          for page_id in ids:
+              try:
+                  page = notion("GET", f"/pages/{page_id}")
+                  db_id = (page.get("parent") or {}).get("database_id")
+                  if not db_id:
+                      print(f"::warning::Notion page {page_id} isn't a database row; nothing to mark complete")
+                      continue
+                  schema = notion("GET", f"/databases/{db_id}").get("properties") or {}
+                  patch = completion_patch(page, schema)
+                  if not patch:
+                      print(f"::warning::Notion task {page_id}: its database has no Status/Completed columns to set")
+                      continue
+                  notion("PATCH", f"/pages/{page_id}", {"properties": patch})
+                  comment(page_id)
+                  print(f"Completed Notion task {page_id} ({', '.join(patch)})")
+              except Exception as exc:
+                  print(f"::error::Could not complete Notion task {page_id}: {exc}")
+                  failures += 1
+          sys.exit(1 if failures else 0)
+          PYEOF
