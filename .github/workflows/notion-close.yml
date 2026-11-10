@@ -3,8 +3,13 @@ name: Close Notion tasks on merged PRs
 # Marks Notion tasks referenced in a merged PR's description complete.
 # Convention: put "closes <notion task URL>" or "closes <bare page id>"
 # (case-insensitive) in the PR body, one per task. A markdown link
-# ("closes [title](<notion URL>)") works too. Only MERGED PRs complete
-# tasks; a PR closed without merging leaves its tasks open.
+# ("closes [title](<notion URL>)") works too, and so does a wts-insights
+# workboard link with the task open (its ?task=<page id>). Only MERGED
+# PRs complete tasks; a PR closed without merging leaves its tasks open.
+#
+# A closes line added to the body AFTER the merge counts too: editing a
+# merged PR's body reruns this, and only the ids the edit added are
+# completed, so fixing a typo never re-completes or re-comments.
 #
 # "Complete" means whatever the task's database has, each best effort:
 # a Status column (select or status) set to its Complete option (or
@@ -24,7 +29,7 @@ name: Close Notion tasks on merged PRs
 # the completion columns named above.
 on:
   pull_request:
-    types: [closed]
+    types: [closed, edited]
   workflow_call:
     secrets:
       NOTION_TOKEN:
@@ -41,15 +46,20 @@ jobs:
     # body plausibly contains a closes reference. contains() is
     # case-insensitive and coarse by design; the script's parser makes
     # the precise call, so prose like "closes the loop" just no-ops.
+    # An edit only counts when it touched the body (not the title or
+    # base branch) of a PR that has already merged.
     if: >-
       github.event.pull_request.merged == true &&
-      contains(github.event.pull_request.body, 'closes')
+      contains(github.event.pull_request.body, 'closes') &&
+      (github.event.action == 'closed' || github.event.changes.body)
     runs-on: ubuntu-latest
     steps:
       - name: Complete referenced Notion tasks
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           PR_BODY: ${{ github.event.pull_request.body }}
+          # The body before an edit; empty on the merge itself.
+          OLD_BODY: ${{ github.event.changes.body.from }}
           PR_URL: ${{ github.event.pull_request.html_url }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -66,6 +76,7 @@ jobs:
           from datetime import datetime, timezone
 
           body = os.environ.get("PR_BODY") or ""
+          old_body = os.environ.get("OLD_BODY") or ""
           token = os.environ.get("NOTION_TOKEN") or ""
           pr_url = os.environ.get("PR_URL") or ""
 
@@ -82,30 +93,42 @@ jobs:
                       f"{raw[16:20]}-{raw[20:32]}")
 
           def page_id_from_url(url):
-              """The page a Notion URL points at. A database view with a
-              task open in peek mode carries the task as ?p=<id>; that
-              wins over the path, which names the database."""
+              """The page a task URL points at. A Notion database view
+              with a task open in peek mode carries the task as ?p=<id>,
+              and a wts-insights workboard as ?task=<id>; either wins
+              over the path, which names the database or the board."""
               parsed = urllib.parse.urlparse(url)
-              peek = urllib.parse.parse_qs(parsed.query).get("p") or []
+              query = urllib.parse.parse_qs(parsed.query)
+              peek = (query.get("p") or []) + (query.get("task") or [])
               for value in peek + [parsed.path]:
                   found = re.findall(ID, value)
                   if found:
                       return norm(found[-1])
               return None
 
-          # "closes <notion URL>", optionally wrapped as a markdown link
-          # ("closes [title](url)") or in angle brackets.
-          urls = re.findall(
-              r"closes\s+(?:\[[^\]]*\]\()?<?"
-              r"(https?://[\w.-]*notion\.(?:so|site|com)/[^\s>)]+)",
-              body, re.IGNORECASE,
-          )
-          ids = [page_id_from_url(u) for u in urls]
-          # "closes <bare page id>". Asana gids are all digits and
-          # shorter, and GitHub's "closes #123" has a hash, so neither
-          # collides with a 32-hex id.
-          ids += [norm(m) for m in re.findall(r"closes\s+" + ID, body, re.IGNORECASE)]
-          ids = list(dict.fromkeys(i for i in ids if i))
+          def task_ids(text):
+              """Page ids referenced as closes in `text`, in order, once
+              each."""
+              # "closes <notion or wts-insights URL>", optionally wrapped
+              # as a markdown link ("closes [title](url)") or in angle
+              # brackets.
+              urls = re.findall(
+                  r"closes\s+(?:\[[^\]]*\]\()?<?"
+                  r"(https?://(?:[\w.-]*notion\.(?:so|site|com)"
+                  r"|wts-insights\.[\w.-]+)/[^\s>)]+)",
+                  text, re.IGNORECASE,
+              )
+              found = [page_id_from_url(u) for u in urls]
+              # "closes <bare page id>". Asana gids are all digits and
+              # shorter, and GitHub's "closes #123" has a hash, so neither
+              # collides with a 32-hex id.
+              found += [norm(m) for m in re.findall(r"closes\s+" + ID, text, re.IGNORECASE)]
+              return list(dict.fromkeys(i for i in found if i))
+
+          # On an edit, only what the edit added: ids already in the old
+          # body were completed (or skipped) when they first appeared.
+          already = set(task_ids(old_body))
+          ids = [i for i in task_ids(body) if i not in already]
 
           if not ids:
               print("No 'closes <notion task URL>' references in the PR body; nothing to do.")
