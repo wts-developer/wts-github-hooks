@@ -15,7 +15,7 @@ consuming repos add a small caller and get fixes automatically.
 | Workflow | What it does | Secrets |
 |---|---|---|
 | [`asana-close.yml`](.github/workflows/asana-close.yml) | When a PR merges, completes every Asana task referenced in its body as `closes <asana task URL>` or `closes <bare task id>`; also sets a Status enum custom field to Complete when the task has one, comments the PR link on the task, and rewrites bare ids in the PR body into clickable Asana links. PRs closed without merging leave tasks open. | `ASANA_PAT` |
-| [`notion-close.yml`](.github/workflows/notion-close.yml) | When a PR merges, completes every Notion task referenced in its body as `closes <notion task URL>` (a markdown link works too) or `closes <bare page id>`. Completing means whatever the task's database has: Status set to its Complete (or Done) option, a Completed checkbox ticked, an empty Completed at date set to today; nothing is created. Also comments the PR link on the task and rewrites bare page ids in the PR body into Notion links. PRs closed without merging leave tasks open. | `NOTION_TOKEN` |
+| [`notion-close.yml`](.github/workflows/notion-close.yml) | When a PR merges, completes every Notion task referenced in its body as `closes <notion task URL>` (a markdown link or a wts-insights workboard link to the task works too) or `closes <bare page id>`. A closes line added to a merged PR's body later also counts. Completing means whatever the task's database has: Status set to its Complete (or Done) option, a Completed checkbox ticked, an empty Completed at date set to today; nothing is created. Also comments the PR link on the task and rewrites bare page ids in the PR body into Notion links. PRs closed without merging leave tasks open. | `NOTION_TOKEN` |
 
 ## Consuming a workflow
 
@@ -44,8 +44,9 @@ caller's permissions, and `asana-close` needs `pull-requests: write` to
 linkify task ids in the merged PR body.
 
 The Notion caller is the same shape: `notion-close.yml` in place of
-`asana-close.yml`, and `NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}` in
-place of the Asana secret. Both can run side by side; each ignores the
+`asana-close.yml`, `types: [closed, edited]` so a closes line added
+after the merge is picked up, and `NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}`
+in place of the Asana secret. Both can run side by side; each ignores the
 other's references.
 
 ### Secrets
@@ -68,9 +69,14 @@ shared" error in the run log. Same org-secret arrangement as
 
 Use **Copy link** on the task in Notion and paste it after `closes`.
 A link copied while the task is open in a database's side peek works
-too (the task is read from its `p=` parameter). A bare 32-character
-page id (the hex at the end of the link) also works and is turned into
-a link on merge.
+too (the task is read from its `p=` parameter), and so does a
+wts-insights workboard link with the task open (read from its `task=`
+parameter). A bare 32-character page id (the hex at the end of the
+link) also works and is turned into a link on merge.
+
+Forgot the closes line? Edit it into the merged PR's description: the
+edit reruns the workflow, which completes only the tasks the edit
+added.
 
 ### Versioning
 
